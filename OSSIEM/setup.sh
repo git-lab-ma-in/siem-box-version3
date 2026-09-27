@@ -1723,6 +1723,73 @@ if [ "$DO_SOCFORTRESS_RULES" = "yes" ]; then
     log "Da khoi dong lai wazuh.manager de ap dung bo luat SOCFortress."
 fi
 
+# ================================= 8b. Tao Graylog Input nhan log tu Wazuh
+# Wazuh (qua Fluent Bit trong custom-wazuh-manager) gui log toi graylog:5555 dang
+# TCP tho (JSON lines). Mac dinh Graylog KHONG co input nao lang nghe cong nay -
+# o ban huong dan chinh thuc, buoc nay duoc lam thu cong bang nut "Stack Provisioning"
+# trong giao dien CoPilot. O day ta tao thang input do qua REST API cua Graylog,
+# hoat dong du co dung CoPilot hay khong (--no-copilot van co log chay vao Graylog).
+log "Kiem tra/tao Graylog Input (Raw TCP :5555) de nhan log tu Wazuh ..."
+GRAYLOG_USER="$(grep -E '^GRAYLOG_USERNAME=' .env | cut -d= -f2- || echo admin)"
+GRAYLOG_PASS="$(grep -E '^GRAYLOG_PASSWORD=' .env | cut -d= -f2- || echo yourpassword)"
+GRAYLOG_READY="no"
+for _try in $(seq 1 24); do
+    if curl -fsS -u "${GRAYLOG_USER}:${GRAYLOG_PASS}" "http://localhost:9000/api/system/lbstatus" >/dev/null 2>&1; then
+        GRAYLOG_READY="yes"; break
+    fi
+    sleep 5
+done
+if [ "$GRAYLOG_READY" = "no" ]; then
+    warn "Graylog API chua san sang sau khi doi - bo qua tao Input tu dong. Tao thu cong: System > Inputs > Raw/Plaintext TCP, cong 5555, hoac dung nut Stack Provisioning trong CoPilot."
+else
+    EXISTING="$(curl -fsS -u "${GRAYLOG_USER}:${GRAYLOG_PASS}" "http://localhost:9000/api/system/inputs" 2>/dev/null | grep -o '"title":"[^"]*wazuh[^"]*"' -i || true)"
+    if [ -n "$EXISTING" ]; then
+        log "  Da co Input nhan log Wazuh tu truoc, bo qua (neu da dung Stack Provisioning cua CoPilot thi khong can lam gi them)."
+    else
+        RESP="$(curl -fsS -u "${GRAYLOG_USER}:${GRAYLOG_PASS}" -H 'Content-Type: application/json' -H 'X-Requested-By: ossiem-setup' \
+            -X POST "http://localhost:9000/api/system/inputs" -d '{
+                "title": "Wazuh Raw TCP 5555",
+                "type": "org.graylog2.inputs.raw.tcp.RawTCPInput",
+                "global": true,
+                "configuration": {
+                    "bind_address": "0.0.0.0",
+                    "port": 5555,
+                    "recv_buffer_size": 1048576,
+                    "max_message_size": 2097152,
+                    "tls_enable": false,
+                    "tcp_keepalive": false,
+                    "use_null_delimiter": false,
+                    "number_worker_threads": 4
+                }
+            }' 2>&1)"
+        if echo "$RESP" | grep -q '"id"'; then
+            log "  Da tao Input Raw TCP :5555 tren Graylog - Wazuh se bat dau gui log vao ngay khi restart."
+            docker restart wazuh.manager >/dev/null 2>&1 || true
+        else
+            warn "  Khong tao duoc Input qua API ($RESP). Tao thu cong: System > Inputs > Raw/Plaintext TCP, cong 5555."
+        fi
+    fi
+    warn "Luu y: Input nay nhan log THO (JSON tho, chua tach truong). Muon tach truong dep nhu ban CoPilot Stack Provisioning, vao Graylog UI > Inputs > Manage Extractors > dan 1 dong log mau > chon 'Load message' > tao JSON extractor - chi mat khoang 1 phut."
+fi
+
+# ============================== 8c. Sinh api.config.yaml cho Velociraptor
+# Can cho ca CoPilot backend (upload thu cong o Connectors) lan copilot-mcp (mount
+# tu ./data/copilot-mcp/api.config.yaml - tu dong, khong can lam gi them).
+log "Sinh api.config.yaml cho Velociraptor (dung cho ket noi CoPilot/MCP) ..."
+mkdir -p data/copilot-mcp
+if [ -f data/copilot-mcp/api.config.yaml ]; then
+    log "  Da co api.config.yaml tu truoc, bo qua."
+else
+    if docker exec velociraptor sh -c "./velociraptor --config server.config.yaml config api_client --name admin --role administrator,api /tmp/api.config.yaml" >/dev/null 2>&1; then
+        docker cp velociraptor:/tmp/api.config.yaml data/copilot-mcp/api.config.yaml 2>/dev/null \
+            && sed -i 's/127\.0\.0\.1/velociraptor/g; s/localhost/velociraptor/g' data/copilot-mcp/api.config.yaml \
+            && log "  Da tao data/copilot-mcp/api.config.yaml (copilot-mcp se tu dong dung qua volume mount)." \
+            || warn "  Sinh duoc api.config.yaml trong container nhung khong copy/sua duoc ra ngoai, tao thu cong theo README phan Velociraptor."
+    else
+        warn "  Chua sinh duoc api.config.yaml (Velociraptor co the chua san sang). Tao thu cong theo README phan Velociraptor neu can dung CoPilot/MCP."
+    fi
+fi
+
 # ============================================= 9. Lay mat khau CoPilot
 COPILOT_PW=""
 if [ "$NO_COPILOT" = "yes" ]; then
